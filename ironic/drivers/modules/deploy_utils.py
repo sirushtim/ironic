@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
+import contextlib
 import os
 import re
 import socket
@@ -279,6 +279,10 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
         raise exception.InstanceDeployFailure(_("Parent device '%s' not found")
                                               % dev)
 
+    image_mb = get_image_mb(image_path)
+    if image_mb > root_mb:
+        root_mb = image_mb
+
     # the only way for preserve_ephemeral to be set to true is if we are
     # rebuilding an instance with --preserve_ephemeral.
     commit = not preserve_ephemeral
@@ -318,39 +322,34 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
     return root_uuid
 
 
-def deploy(address, port, iqn, lun, image_path, pxe_config_path,
-           root_mb, swap_mb, ephemeral_mb, ephemeral_format, node_uuid,
-           preserve_ephemeral=False):
-    """All-in-one function to deploy a node.
+def write_to_disk(image_path, dev, node_uuid):
+    """Write an image directly to the disk.
 
+    :param image_path: Path for the instance's disk image.\
+    :param dev: Path for the device to work on.
+
+    """
+    if not is_block_device(dev):
+        raise exception.InstanceDeployFailure(_("Parent device '%s' not found")
+                                              % dev)
+    destroy_disk_metadata(dev, node_uuid)
+    dd(image_path, dev)
+
+
+@contextlib.contextmanager
+def _iscsi_setup_and_handle_errors(address, port, iqn, lun):
+    """Function that yields an iSCSI target device to work on.
     :param address: The iSCSI IP address.
     :param port: The iSCSI port number.
     :param iqn: The iSCSI qualified name.
     :param lun: The iSCSI logical unit number.
-    :param image_path: Path for the instance's disk image.
-    :param pxe_config_path: Path for the instance PXE config file.
-    :param root_mb: Size of the root partition in megabytes.
-    :param swap_mb: Size of the swap partition in megabytes.
-    :param ephemeral_mb: Size of the ephemeral partition in megabytes. If 0,
-        no ephemeral partition will be created.
-    :param ephemeral_format: The type of file system to format the ephemeral
-        partition.
-    :param node_uuid: node's uuid. Used for logging.
-    :param preserve_ephemeral: If True, no filesystem is written to the
-        ephemeral block device, preserving whatever content it had (if the
-        partition table has not changed).
 
     """
-    dev = get_dev(address, port, iqn, lun)
-    image_mb = get_image_mb(image_path)
-    if image_mb > root_mb:
-        root_mb = image_mb
     discovery(address, port)
     login_iscsi(address, port, iqn)
+    dev = get_dev(address, port, iqn, lun)
     try:
-        root_uuid = work_on_disk(dev, root_mb, swap_mb, ephemeral_mb,
-                                 ephemeral_format, image_path, node_uuid,
-                                 preserve_ephemeral)
+        yield dev
     except processutils.ProcessExecutionError as err:
         with excutils.save_and_reraise_exception():
             LOG.error(_("Deploy to address %s failed.") % address)
@@ -364,7 +363,51 @@ def deploy(address, port, iqn, lun, image_path, pxe_config_path,
     finally:
         logout_iscsi(address, port, iqn)
         delete_iscsi(address, port, iqn)
-    switch_pxe_config(pxe_config_path, root_uuid)
     # Ensure the node started netcat on the port after POST the request.
     time.sleep(3)
     notify(address, 10000)
+
+
+def deploy_partition_image(address, port, iqn, lun, image_path,
+                           pxe_config_path, root_mb, swap_mb,
+                           ephemeral_mb, ephemeral_format, node_uuid,
+                           preserve_ephemeral=False):
+    """Function to deploy partition images.
+
+    :param address: The iSCSI IP address.
+    :param port: The iSCSI port number.
+    :param iqn: The iSCSI qualified name.
+    :param lun: The iSCSI logical unit number.
+    :param image_path: Path for the instance's disk image.
+    :param pxe_config_path: Path for the instance PXE config file.
+    :param root_mb: Size of the root partition in megabytes.
+    :param swap_mb: Size of the swap partition in megabytes.
+    :param ephemeral_mb: Size of the ephemeral partition in megabytes.
+        If 0, no ephemeral partition will be created.
+    :param ephemeral_format: The type of file system to format the
+        ephemeral partition.
+    :param node_uuid: node's uuid. Used for logging.        
+    :param preserve_ephemeral: If True, no filesystem is written to the
+        ephemeral block device, preserving whatever content it had (if the
+        partition table has not changed).
+
+    """
+    with _iscsi_setup_and_handle_errors(address, port, iqn, lun) as dev:
+        root_uuid = work_on_disk(dev, root_mb, swap_mb, ephemeral_mb,
+                                 ephemeral_format, image_path, node_uuid,
+                                 preserve_ephemeral)
+        switch_pxe_config(pxe_config_path, root_uuid)
+
+
+def deploy_disk_image(address, port, iqn, lun, image_path, node_uuid):
+    """Function to deploy a disk image.
+
+    :param address: The iSCSI IP address.
+    :param port: The iSCSI port number.
+    :param iqn: The iSCSI qualified name.
+    :param lun: The iSCSI logical unit number.
+    :param image_path: Path for the instance's disk image.
+
+    """
+    with _iscsi_setup_and_handle_errors(address, port, iqn, lun) as dev:
+        write_to_disk(image_path, dev, node_uuid)
