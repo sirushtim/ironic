@@ -87,22 +87,29 @@ class PXEDriverFields(GenericDriverFields):
                            image.
         :param flavor: the flavor object.
         :param preserve_ephemeral: preserve_ephemeral status (bool) to be
-                                   specified during rebuild.
+                               specified during rebuild.
         :returns: a json-patch with the fields that needs to be updated.
 
         """
         patch = []
         patch.append({'path': '/instance_info/image_source', 'op': 'add',
                       'value': image_meta['id']})
-        patch.append({'path': '/instance_info/root_gb', 'op': 'add',
-                      'value': str(instance['root_gb'])})
-        patch.append({'path': '/instance_info/swap_mb', 'op': 'add',
-                      'value': str(flavor['swap'])})
 
         # If flavor contains both ramdisk and kernel ids, use them
         for key, value in self._get_kernel_ramdisk_dict(flavor).items():
             patch.append({'path': '/driver_info/%s' % key,
                           'op': 'add', 'value': value})
+
+        iproperties = image_meta['properties']
+        if iproperties.get('ironic_deploy_disk') == 'True':
+            patch.append({'path': '/instance_info/deploy_disk', 'op': 'add',
+                          'value': 'True'})
+            return patch
+
+        patch.append({'path': '/instance_info/root_gb', 'op': 'add',
+                      'value': str(instance['root_gb'])})
+        patch.append({'path': '/instance_info/swap_mb', 'op': 'add',
+                      'value': str(flavor['swap'])})
 
         if instance.get('ephemeral_gb'):
             patch.append({'path': '/instance_info/ephemeral_gb',
@@ -116,7 +123,6 @@ class PXEDriverFields(GenericDriverFields):
         if preserve_ephemeral is not None:
             patch.append({'path': '/instance_info/preserve_ephemeral',
                           'op': 'add', 'value': str(preserve_ephemeral)})
-
         return patch
 
     def get_cleanup_patch(self, instance, network_info, flavor):

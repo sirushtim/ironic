@@ -131,19 +131,29 @@ def _parse_instance_info(node):
     info = node.instance_info
     i_info = {}
     i_info['image_source'] = info.get('image_source')
-    i_info['root_gb'] = info.get('root_gb')
 
     _check_for_missing_params(i_info)
 
     # Internal use only
     i_info['deploy_key'] = info.get('deploy_key')
+    deploy_disk = info.get('deploy_disk', 'False')
+    err_msg_invalid = _("Can not validate PXE bootloader. Invalid parameter "
+                        "pxe_%(param)s. Reason: %(reason)s")
+    try:
+        i_info['deploy_disk'] = strutils.bool_from_string(deploy_disk,
+                                                          strict=True)
+    except ValueError as e:
+        raise exception.InvalidParameterValue(err_msg_invalid %
+                                    {'param': 'deploy_disk', 'reason': e})
 
+    if i_info['deploy_disk']:
+        return i_info
+
+    i_info['root_gb'] = info.get('root_gb')
     i_info['swap_mb'] = info.get('swap_mb', 0)
     i_info['ephemeral_gb'] = info.get('ephemeral_gb', 0)
     i_info['ephemeral_format'] = info.get('ephemeral_format')
 
-    err_msg_invalid = _("Can not validate PXE bootloader. Invalid parameter "
-                        "%(param)s. Reason: %(reason)s")
     for param in ('root_gb', 'swap_mb', 'ephemeral_gb'):
         try:
             int(i_info[param])
@@ -180,7 +190,6 @@ def _parse_deploy_info(node):
     info.update(_parse_driver_info(node))
     return info
 
-
 def _build_pxe_config_options(node, pxe_info, ctx):
     """Build the PXE config options for a node
 
@@ -201,8 +210,9 @@ def _build_pxe_config_options(node, pxe_info, ctx):
     ironic_api = (CONF.conductor.api_url or
                   keystone.get_service_url()).rstrip('/')
 
+    i_info = _parse_instance_info(node)
+    deploy_disk = i_info['deploy_disk']
     deploy_key = utils.random_alnum(32)
-    i_info = node.instance_info
     i_info['deploy_key'] = deploy_key
     node.instance_info = i_info
     node.save(ctx)
@@ -213,13 +223,14 @@ def _build_pxe_config_options(node, pxe_info, ctx):
         'deployment_iscsi_iqn': "iqn-%s" % node.uuid,
         'deployment_aki_path': pxe_info['deploy_kernel'][1],
         'deployment_ari_path': pxe_info['deploy_ramdisk'][1],
-        'aki_path': pxe_info['kernel'][1],
-        'ari_path': pxe_info['ramdisk'][1],
         'ironic_api_url': ironic_api,
         'pxe_append_params': CONF.pxe.pxe_append_params,
     }
-    return pxe_options
+    if not deploy_disk:
+        pxe_options.update({'aki_path': pxe_info['kernel'][1],
+                            'ari_path': pxe_info['ramdisk'][1]})
 
+    return pxe_options
 
 def _get_image_dir_path(node_uuid):
     """Generate the dir for an instances disk."""
@@ -316,7 +327,7 @@ def _cache_tftp_images(ctx, node, pxe_info):
     """Fetch the necessary kernels and ramdisks for the instance."""
     fileutils.ensure_tree(
         os.path.join(CONF.tftp.tftp_root, node.uuid))
-    LOG.debug("Fetching kernel and ramdisk for node %s",
+    LOG.debug("Fetching necessary kernels and ramdisks for node %s" %
               node.uuid)
     _fetch_images(ctx, TFTPImageCache(), pxe_info.values())
 
@@ -369,7 +380,10 @@ def _get_tftp_image_info(node, ctx):
             os.path.join(CONF.tftp.tftp_root, node.uuid, label)
         )
 
-    i_info = node.instance_info
+    i_info = _parse_instance_info(node)
+    if i_info['deploy_disk']:
+        return image_info
+
     labels = ('kernel', 'ramdisk')
     if not (i_info.get('kernel') and i_info.get('ramdisk')):
         glance_service = service.Service(version=1, context=ctx)
@@ -446,7 +460,11 @@ def _validate_glance_image(ctx, deploy_info):
         raise exception.InvalidParameterValue(_(
             "Image %s not found in Glance") % image_id)
 
+    if deploy_info.get('deploy_disk'):
+        return
+
     missing_props = []
+
     for prop in ('kernel_id', 'ramdisk_id'):
         if not image_props.get(prop):
             missing_props.append(prop)
@@ -502,7 +520,11 @@ class PXEDeploy(base.DeployInterface):
         :returns: deploy state DEPLOYING.
         """
         _cache_instance_image(task.context, task.node)
-        _check_image_size(task)
+
+        #TODO(sirushti): how do we check disk image size?
+        i_info = _parse_instance_info(task.node)
+        if not i_info['deploy_disk']:
+            _check_image_size(task)
 
         # TODO(yuriyz): more secure way needed for pass auth token
         #               to deploy ramdisk
@@ -572,10 +594,10 @@ class VendorPassthru(base.VendorInterface):
     """Interface to mix IPMI and PXE vendor-specific interfaces."""
 
     def _get_deploy_info(self, node, **kwargs):
-        d_info = _parse_deploy_info(node)
+        i_info = _parse_deploy_info(node)
 
         deploy_key = kwargs.get('key')
-        if d_info['deploy_key'] != deploy_key:
+        if i_info['deploy_key'] != deploy_key:
             raise exception.InvalidParameterValue(_("Deploy key does not"
                                                     " match"))
 
@@ -584,14 +606,16 @@ class VendorPassthru(base.VendorInterface):
                   'iqn': kwargs.get('iqn'),
                   'lun': kwargs.get('lun', '1'),
                   'image_path': _get_image_file_path(node.uuid),
-                  'pxe_config_path':
-                      tftp.get_pxe_config_file_path(node.uuid),
-                  'root_mb': 1024 * int(d_info['root_gb']),
-                  'swap_mb': int(d_info['swap_mb']),
-                  'ephemeral_mb': 1024 * int(d_info['ephemeral_gb']),
-                  'preserve_ephemeral': d_info['preserve_ephemeral'],
                   'node_uuid': node.uuid,
             }
+
+        if not i_info['deploy_disk']:
+            params.update({'pxe_config_path': tftp.get_pxe_config_file_path(
+                                                                  node.uuid),
+                           'root_mb': 1024 * int(i_info['root_gb']),
+                           'swap_mb': int(i_info['swap_mb']),
+                           'ephemeral_mb': 1024 * int(i_info['ephemeral_gb']),
+                           'preserve_ephemeral': i_info['preserve_ephemeral']})
 
         missing = [key for key in params.keys() if params[key] is None]
         if missing:
@@ -600,7 +624,8 @@ class VendorPassthru(base.VendorInterface):
                     " for deploy.") % missing)
 
         # ephemeral_format is nullable
-        params['ephemeral_format'] = d_info.get('ephemeral_format')
+        if not i_info['deploy_disk']:
+            params['ephemeral_format'] = i_info.get('ephemeral_format')
 
         return params
 
@@ -652,6 +677,7 @@ class VendorPassthru(base.VendorInterface):
 
         params = self._get_deploy_info(node, **kwargs)
         ramdisk_error = kwargs.get('error')
+        i_info = _parse_instance_info(node)
 
         if ramdisk_error:
             LOG.error(_('Error returned from PXE deploy ramdisk: %s')
@@ -664,7 +690,18 @@ class VendorPassthru(base.VendorInterface):
                    '%(params)s') % {'node': node.uuid, 'params': params})
 
         try:
-            deploy_utils.deploy(**params)
+            if i_info['deploy_disk']:
+                deploy_utils.deploy_disk_image(**params)
+                dhcp_opts = [{'opt_name': 'bootfile-name',
+                              'opt_value': None},
+                              {'opt_name': 'server-ip-address',
+                              'opt_value': None},
+                              {'opt_name': 'tftp-server',
+                              'opt_value': None}]
+                neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name, dhcp_opts)
+                manager_utils.node_set_boot_device(task, node, 'disk')
+            else:
+                deploy_utils.deploy_partition_image(**params)
         except Exception as e:
             LOG.error(_('PXE deploy failed for instance %(instance)s. '
                         'Error: %(error)s') % {'instance': node.instance_uuid,
