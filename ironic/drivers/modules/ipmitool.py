@@ -61,6 +61,10 @@ LOG = logging.getLogger(__name__)
 
 VALID_BOOT_DEVICES = ['pxe', 'disk', 'safe', 'cdrom', 'bios']
 VALID_PRIV_LEVELS = ['ADMINISTRATOR', 'CALLBACK', 'OPERATOR', 'USER']
+OPTIONS = [('username', '-U'), ('local_address', '-m'),
+           ('transit_channel', '-B'), ('transit_address', '-T'),
+           ('target_channel', '-b'), ('target_address', '-t')]
+
 LAST_CMD_TIME = {}
 TIMING_SUPPORT = None
 
@@ -104,7 +108,6 @@ def check_timing_support():
             # looks like ipmitool supports timing options.
             _is_timing_supported(True)
 
-
 def _console_pwfile_path(uuid):
     """Return the file path for storing the ipmi password for a console."""
     file_name = "%(uuid)s.pw" % {'uuid': uuid}
@@ -146,6 +149,11 @@ def _parse_driver_info(node):
     password = info.get('ipmi_password')
     port = info.get('ipmi_terminal_port')
     priv_level = info.get('ipmi_priv_level', 'ADMINISTRATOR')
+    local_address = info.get('ipmi_local_address')
+    transit_channel = info.get('ipmi_transit_channel')
+    transit_address = info.get('ipmi_transit_address')
+    target_channel = info.get('ipmi_target_channel')
+    target_address = info.get('ipmi_target_address')
 
     if port:
         try:
@@ -157,6 +165,10 @@ def _parse_driver_info(node):
     if not address:
         raise exception.InvalidParameterValue(_(
             "IPMI address not supplied to IPMI driver."))
+
+    if transit_address and not target_address:
+        raise exception.InvalidParameterValue(_(
+            "transit address specified without any target address."))
 
     if priv_level not in VALID_PRIV_LEVELS:
         valid_priv_lvls = ', '.join(VALID_PRIV_LEVELS)
@@ -171,7 +183,12 @@ def _parse_driver_info(node):
             'password': password,
             'port': port,
             'uuid': node.uuid,
-            'priv_level': priv_level
+            'priv_level': priv_level,
+            'local_address': local_address,
+            'transit_channel': transit_channel,
+            'transit_address': transit_address,
+            'target_channel': target_channel,
+            'target_address': target_address
            }
 
 
@@ -195,9 +212,10 @@ def _exec_ipmitool(driver_info, command):
             '-L', driver_info.get('priv_level')
             ]
 
-    if driver_info['username']:
-        args.append('-U')
-        args.append(driver_info['username'])
+    for name, option in OPTIONS:
+        if driver_info[name] is not None:
+            args.append(option)
+            args.append(driver_info[name])
 
     # specify retry timing more precisely, if supported
     if _is_timing_supported():
@@ -514,12 +532,17 @@ class IPMIShellinaboxConsole(base.ConsoleInterface):
                 path, driver_info['password'])
 
         ipmi_cmd = "/:%(uid)s:%(gid)s:HOME:ipmitool -H %(address)s" \
-                   " -I lanplus -U %(user)s -f %(pwfile)s"  \
+                   " -I lanplus -f %(pwfile)s"  \
                    % {'uid': os.getuid(),
                       'gid': os.getgid(),
                       'address': driver_info['address'],
-                      'user': driver_info['username'],
                       'pwfile': pw_file}
+
+        for name, option in OPTIONS:
+            if driver_info[name] is not None:
+                ipmi_cmd = " ".join([ipmi_cmd,
+                                     option, driver_info[name]])
+
         if CONF.debug:
             ipmi_cmd += " -v"
         ipmi_cmd += " sol activate"

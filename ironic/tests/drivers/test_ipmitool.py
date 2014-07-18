@@ -112,17 +112,39 @@ class IPMIToolPrivateMethodTestCase(base.TestCase):
 
     def test__parse_driver_info(self, mock_sleep):
         # make sure we get back the expected things
-        self.assertIsNotNone(self.info.get('address'))
-        self.assertIsNotNone(self.info.get('username'))
-        self.assertIsNotNone(self.info.get('password'))
-        self.assertIsNotNone(self.info.get('uuid'))
+        _OPTIONS = ['address', 'username', 'password', 'uuid', 'local_address',
+                    'transit_channel', 'transit_address', 'target_channel',
+                    'target_address']
+        for option in _OPTIONS:
+            self.assertIsNotNone(self.info.get(option))
 
         info = dict(INFO_DICT)
 
-        # test the default value for 'priv_level'
+        # test the default value for 'priv_level' and double bridging
         node = obj_utils.get_test_node(self.context, driver_info=info)
         ret = ipmi._parse_driver_info(node)
         self.assertEqual('ADMINISTRATOR', ret['priv_level'])
+
+        # make sure error is raised when ipmi_target_address is missing
+        # in double bridging
+        del info['ipmi_target_address']
+        node = obj_utils.get_test_node(self.context, driver_info=info)
+        self.assertRaises(exception.InvalidParameterValue,
+                          ipmi._parse_driver_info,
+                          node)
+
+        info = dict(INFO_DICT)
+
+        # test with single bridging
+        del info['ipmi_transit_channel'], info['ipmi_transit_address']
+        node = obj_utils.get_test_node(self.context, driver_info=info)
+        ipmi._parse_driver_info(node)
+
+        # test without bridging
+        del info['ipmi_local_address'], info['ipmi_target_channel'], \
+            info['ipmi_target_address']
+        node = obj_utils.get_test_node(self.context, driver_info=info)
+        ipmi._parse_driver_info(node)
 
         # ipmi_username / ipmi_password are not mandatory
         del info['ipmi_username']
@@ -318,6 +340,11 @@ class IPMIToolPrivateMethodTestCase(base.TestCase):
             '-H', self.info['address'],
             '-L', self.info['priv_level'],
             '-U', self.info['username'],
+            '-m', self.info['local_address'],
+            '-B', self.info['transit_channel'],
+            '-T', self.info['transit_address'],
+            '-b', self.info['target_channel'],
+            '-t', self.info['target_address'],
             '-f', file_handle,
             'A', 'B', 'C',
             ]
@@ -347,6 +374,11 @@ class IPMIToolPrivateMethodTestCase(base.TestCase):
             '-U', self.info['username'],
             '-R', '12',
             '-N', '5',
+            '-m', self.info['local_address'],
+            '-B', self.info['transit_channel'],
+            '-T', self.info['transit_address'],
+            '-b', self.info['target_channel'],
+            '-t', self.info['target_address'],
             '-f', file_handle,
             'A', 'B', 'C',
             ]
@@ -374,6 +406,62 @@ class IPMIToolPrivateMethodTestCase(base.TestCase):
             '-I', 'lanplus',
             '-H', self.info['address'],
             '-L', self.info['priv_level'],
+            '-m', self.info['local_address'],
+            '-B', self.info['transit_channel'],
+            '-T', self.info['transit_address'],
+            '-b', self.info['target_channel'],
+            '-t', self.info['target_address'],
+            '-f', file_handle,
+            'A', 'B', 'C',
+            ]
+
+        mock_pwf.return_value = file_handle
+        mock_exec.return_value = (None, None)
+        ipmi._exec_ipmitool(self.info, 'A B C')
+        self.assertTrue(mock_pwf.called)
+        mock_exec.assert_called_once_with(*args, attempts=3)
+
+    @mock.patch.object(ipmi, '_make_password_file', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__exec_ipmitool_with_single_bridging(self, mock_exec, mock_pwf):
+        self.info['transit_channel'] = self.info['transit_address'] = None
+        pw_file_handle = tempfile.NamedTemporaryFile()
+        pw_file = pw_file_handle.name
+        file_handle = open(pw_file, "w")
+        args = [
+            'ipmitool',
+            '-I', 'lanplus',
+            '-H', self.info['address'],
+            '-L', self.info['priv_level'],
+            '-U', self.info['username'],
+            '-m', self.info['local_address'],
+            '-b', self.info['target_channel'],
+            '-t', self.info['target_address'],
+            '-f', file_handle,
+            'A', 'B', 'C',
+            ]
+
+        mock_pwf.return_value = file_handle
+        mock_exec.return_value = (None, None)
+        ipmi._exec_ipmitool(self.info, 'A B C')
+        self.assertTrue(mock_pwf.called)
+        mock_exec.assert_called_once_with(*args, attempts=3)
+
+    @mock.patch.object(ipmi, '_make_password_file', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__exec_ipmitool_without_bridging(self, mock_exec, mock_pwf):
+        self.info['local_address'] = self.info['transit_channel'] = \
+            self.info['transit_address'] = self.info['target_channel'] = \
+            self.info['target_address'] = None
+        pw_file_handle = tempfile.NamedTemporaryFile()
+        pw_file = pw_file_handle.name
+        file_handle = open(pw_file, "w")
+        args = [
+            'ipmitool',
+            '-I', 'lanplus',
+            '-H', self.info['address'],
+            '-L', self.info['priv_level'],
+            '-U', self.info['username'],
             '-f', file_handle,
             'A', 'B', 'C',
             ]
@@ -399,6 +487,11 @@ class IPMIToolPrivateMethodTestCase(base.TestCase):
             '-H', self.info['address'],
             '-L', self.info['priv_level'],
             '-U', self.info['username'],
+            '-m', self.info['local_address'],
+            '-B', self.info['transit_channel'],
+            '-T', self.info['transit_address'],
+            '-b', self.info['target_channel'],
+            '-t', self.info['target_address'],
             '-f', file_handle,
             'A', 'B', 'C',
             ]
